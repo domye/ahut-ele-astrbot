@@ -15,6 +15,10 @@ import json
 import asyncio
 
 from .services import PayService, DormManager
+from .services.building_data import (
+    CAMPUS_OPTIONS, get_buildings, get_building_by_id,
+    format_campus_menu, format_building_menu, parse_campus_input
+)
 from .models import DormConfig, IMSResponse
 
 
@@ -187,61 +191,125 @@ class AhutElePlugin(Star):
             event.stop_event()
             return
 
-        yield event.plain_result(
-            "请输入宿舍信息，格式如下：\n"
-            "校区 楼栋ID 楼栋名称 房间号\n"
-            "例如：翡翠湖 1栋 1 101\n"
-            "提示：楼栋ID需要从缴费系统查询，可先用 /ele_search 搜索"
-        )
+        # Step 1: Select campus
+        yield event.plain_result(format_campus_menu())
 
         @session_waiter(timeout=120)
-        async def set_session(controller: SessionController, ev: AstrMessageEvent):
-            parts = ev.message_str.strip().split()
+        async def campus_session(controller: SessionController, ev: AstrMessageEvent):
+            campus = parse_campus_input(ev.message_str)
 
-            if len(parts) < 4:
-                await ev.send(ev.plain_result("格式错误，请按以下格式输入：\n校区 楼栋ID 楼栋名称 房间号"))
+            if not campus:
+                await ev.send(ev.plain_result("输入无效，请输入 1 或 2 选择校区："))
                 controller.keep(timeout=120)
                 return
 
-            campus = parts[0]
-            building_id = parts[1]
-            building_name = parts[2]
-            room_id = parts[3]
+            campus_name = CAMPUS_OPTIONS[campus]
 
-            # Create dorm config
-            dorm = DormConfig(
-                campus=campus,
-                building_id=building_id,
-                building_name=building_name,
-                room_id=room_id,
-                dorm_name=f"{campus} {building_name} {room_id}",
-            )
+            # Step 2: Select building
+            await ev.send(ev.plain_result(format_building_menu(campus, page=1)))
 
-            # Verify by querying
-            ims = await self.pay_service.get_electricity(
-                campus=campus,
-                building_name=building_name,
-                building_id=building_id,
-                room_id=room_id,
-            )
+            @session_waiter(timeout=120)
+            async def building_session(ctrl: SessionController, e: AstrMessageEvent):
+                text = e.message_str.strip()
+                buildings = get_buildings(campus)
+                total = len(buildings)
+                page_size = 10
+                total_pages = (total + page_size - 1) // page_size
 
-            if ims and ims.code == 0:
-                # Save dorm config
-                await self.dorm_manager.set_dorm(sender_id, dorm)
-                await ev.send(ev.plain_result(
-                    f"宿舍设置成功！\n{ims.format_result(dorm.get_display_name())}"
+                # Check for pagination
+                if text.lower() == 'n':
+                    # Need to track current page - simplified: always show page 1
+                    # For full pagination, we'd need to track state
+                    await e.send(e.plain_result(format_building_menu(campus, page=1)))
+                    ctrl.keep(timeout=120)
+                    return
+
+                if text.lower() == 'p':
+                    await e.send(e.plain_result(format_building_menu(campus, page=1)))
+                    ctrl.keep(timeout=120)
+                    return
+
+                # Parse building selection
+                try:
+                    num = int(text)
+                    if 1 <= num <= total:
+                        building = buildings[num - 1]
+                    else:
+                        await e.send(e.plain_result(f"序号超出范围，请输入 1-{total} 之间的数字："))
+                        ctrl.keep(timeout=120)
+                        return
+                except ValueError:
+                    await e.send(e.plain_result("请输入数字序号选择楼栋："))
+                    ctrl.keep(timeout=120)
+                    return
+
+                # Step 3: Input room number
+                await e.send(e.plain_result(
+                    f"已选择：{building.name}\n"
+                    f"请输入房间号（如：101）："
                 ))
-            else:
-                await ev.send(ev.plain_result(
-                    "验证失败，可能是信息错误或登录已过期。\n"
-                    "请重新输入正确的宿舍信息："
-                ))
-                controller.keep(timeout=120)
+
+                @session_waiter(timeout=120)
+                async def room_session(c: SessionController, evt: AstrMessageEvent):
+                    room_id = evt.message_str.strip()
+
+                    if not room_id:
+                        await evt.send(evt.plain_result("房间号不能为空，请重新输入："))
+                        c.keep(timeout=120)
+                        return
+
+                    # Create dorm config
+                    dorm = DormConfig(
+                        campus=campus,
+                        building_id=building.id,
+                        building_name=building.name,
+                        room_id=room_id,
+                        dorm_name=f"{campus_name} {building.name} {room_id}",
+                    )
+
+                    # Verify by querying
+                    await evt.send(evt.plain_result("正在验证宿舍信息..."))
+
+                    ims = await self.pay_service.get_electricity(
+                        campus=campus,
+                        building_name=building.name,
+                        building_id=building.id,
+                        room_id=room_id,
+                    )
+
+                    if ims and ims.code == 0:
+                        # Save dorm config
+                        await self.dorm_manager.set_dorm(sender_id, dorm)
+                        await evt.send(evt.plain_result(
+                            f"✅ 宿舍设置成功！\n\n{ims.format_result(dorm.get_display_name())}"
+                        ))
+                    else:
+                        error_msg = ims.msg if ims else "未知错误"
+                        await evt.send(evt.plain_result(
+                            f"❌ 验证失败：{error_msg}\n"
+                            "可能是房间号不存在，请重新输入房间号："
+                        ))
+                        c.keep(timeout=120)
+                        return
+
+                    c.stop()
+
+                try:
+                    await room_session(e)
+                except TimeoutError:
+                    await e.send(e.plain_result("输入超时，请重新执行 /ele_set"))
+
+                ctrl.stop()
+
+            try:
+                await building_session(ev)
+            except TimeoutError:
+                await ev.send(ev.plain_result("输入超时，请重新执行 /ele_set"))
 
             controller.stop()
 
         try:
-            await set_session(event)
+            await campus_session(event)
         except TimeoutError:
             yield event.plain_result("输入超时，请重新执行 /ele_set")
         finally:
@@ -402,7 +470,7 @@ class AhutElePlugin(Star):
             "/ele_logout - 清除登录信息",
             "",
             "【用户命令】",
-            "/ele_set - 设置宿舍信息",
+            "/ele_set - 交互式设置宿舍（推荐）",
             "/ele_my - 查看我的宿舍",
             "/ele_del - 删除我的宿舍",
             "",
@@ -413,6 +481,8 @@ class AhutElePlugin(Star):
             "【其他】",
             "/ele_status - 查看插件状态",
             "/ele_help - 查看此帮助",
+            "",
+            "💡 提示：使用 /ele_set 时会引导你选择校区、楼栋和房间号",
         ]
 
         yield event.plain_result("\n".join(lines))

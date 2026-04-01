@@ -2,5 +2,6 @@
 
 from .pay_service import PayService
 from .dorm_manager import DormManager
+from . import building_data
 
-__all__ = ["PayService", "DormManager"]
+__all__ = ["PayService", "DormManager", "building_data"]
