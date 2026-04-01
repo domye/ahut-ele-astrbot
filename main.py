@@ -136,6 +136,7 @@ class AhutElePlugin(Star):
 
                 if success:
                     # Save credentials
+                    self.pay_service.set_credentials(username, password)
                     await self._save_credentials(username, password)
                     await e.send(e.plain_result(f"登录成功！{message}\n已保存登录信息。"))
                 else:
