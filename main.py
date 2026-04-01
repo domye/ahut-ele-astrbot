@@ -1,24 +1,417 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+"""AHUT Electricity Query Plugin for AstrBot.
 
-@register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
-class MyPlugin(Star):
-    def __init__(self, context: Context):
+Features:
+- Admin can set pay system login credentials
+- Users can set their dormitory configuration
+- Query electricity for all configured dorms
+"""
+
+from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.star import Context, Star, register
+from astrbot.api import AstrBotConfig, logger
+from astrbot.core.utils.session_waiter import session_waiter, SessionController
+from pathlib import Path
+import json
+import asyncio
+
+from .services import PayService, DormManager
+from .models import DormConfig, IMSResponse
+
+
+@register("ahut_ele", "domye", "安徽工业大学电费查询插件", "1.0.0")
+class AhutElePlugin(Star):
+    """AHUT electricity query plugin."""
+
+    def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
+        self.config = config
+
+        # Services
+        self.pay_service = PayService()
+        self.dorm_manager = DormManager(self.name)
+
+        # Admin users from config
+        self.admin_users = config.get("admin_users", [])
+
+        # Credentials storage path
+        self._data_path = Path("data/plugin_data") / self.name
 
     async def initialize(self):
-        """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
+        """Initialize the plugin."""
+        self._data_path.mkdir(parents=True, exist_ok=True)
 
-    # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
-    @filter.command("helloworld")
-    async def helloworld(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令""" # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
-        user_name = event.get_sender_name()
-        message_str = event.message_str # 用户发的纯文本消息字符串
-        message_chain = event.get_messages() # 用户所发的消息的消息链 # from astrbot.api.message_components import *
-        logger.info(message_chain)
-        yield event.plain_result(f"Hello, {user_name}, 你发了 {message_str}!") # 发送一条纯文本消息
+        # Initialize dorm manager
+        await self.dorm_manager.initialize()
+
+        # Load stored credentials
+        await self._load_credentials()
+
+        logger.info(f"{self.name} initialized")
 
     async def terminate(self):
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+        """Cleanup on shutdown."""
+        await self.pay_service.close()
+        logger.info(f"{self.name} terminated")
+
+    async def _load_credentials(self):
+        """Load stored credentials."""
+        creds_file = self._data_path / "credentials.json"
+        if creds_file.exists():
+            try:
+                with open(creds_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                username = data.get("username", "")
+                password = data.get("password", "")
+                if username and password:
+                    self.pay_service.set_credentials(username, password)
+                    logger.info("Loaded stored credentials")
+            except Exception as e:
+                logger.error(f"Failed to load credentials: {e}")
+
+    async def _save_credentials(self, username: str, password: str):
+        """Save credentials to file."""
+        creds_file = self._data_path / "credentials.json"
+        try:
+            # Note: Password is stored locally, not in keyring for simplicity
+            # In production, consider using keyring or encryption
+            data = {"username": username, "password": password}
+            with open(creds_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f)
+            logger.info("Credentials saved")
+        except Exception as e:
+            logger.error(f"Failed to save credentials: {e}")
+
+    async def _clear_credentials(self):
+        """Clear stored credentials."""
+        creds_file = self._data_path / "credentials.json"
+        if creds_file.exists():
+            try:
+                creds_file.unlink()
+            except Exception as e:
+                logger.error(f"Failed to delete credentials file: {e}")
+
+    def _is_admin(self, sender_id: str) -> bool:
+        """Check if user is admin."""
+        # If no admin configured, first user can become admin
+        if not self.admin_users:
+            return True
+        return sender_id in self.admin_users or str(sender_id) in self.admin_users
+
+    # === Admin Commands ===
+
+    @filter.command("ele_login")
+    async def ele_login(self, event: AstrMessageEvent):
+        """设置缴费系统登录信息（管理员）。用法: /ele_login"""
+        sender_id = str(event.get_sender_id())
+
+        if not self._is_admin(sender_id):
+            yield event.plain_result("权限不足，此命令仅限管理员使用。")
+            event.stop_event()
+            return
+
+        yield event.plain_result("请输入缴费系统用户名（学号）：")
+
+        @session_waiter(timeout=60)
+        async def login_session(controller: SessionController, ev: AstrMessageEvent):
+            username = ev.message_str.strip()
+
+            if not username:
+                await ev.send(ev.plain_result("用户名不能为空，请重新输入："))
+                controller.keep(timeout=60)
+                return
+
+            await ev.send(ev.plain_result("请输入缴费系统密码："))
+
+            @session_waiter(timeout=60)
+            async def password_session(ctrl: SessionController, e: AstrMessageEvent):
+                password = e.message_str.strip()
+
+                if not password:
+                    await e.send(e.plain_result("密码不能为空，请重新输入："))
+                    ctrl.keep(timeout=60)
+                    return
+
+                # Try login
+                success, message = await self.pay_service.login(username, password)
+
+                if success:
+                    # Save credentials
+                    await self._save_credentials(username, password)
+                    await e.send(e.plain_result(f"登录成功！{message}\n已保存登录信息。"))
+                else:
+                    await e.send(e.plain_result(f"登录失败：{message}\n请重新输入用户名："))
+                    controller.keep(timeout=60)
+
+                ctrl.stop()
+
+            try:
+                await password_session(ev)
+            except TimeoutError:
+                await ev.send(ev.plain_result("输入超时，请重新执行 /ele_login"))
+
+            controller.stop()
+
+        try:
+            await login_session(event)
+        except TimeoutError:
+            yield event.plain_result("输入超时，请重新执行 /ele_login")
+        finally:
+            event.stop_event()
+
+    @filter.command("ele_logout")
+    async def ele_logout(self, event: AstrMessageEvent):
+        """清除缴费系统登录信息（管理员）。用法: /ele_logout"""
+        sender_id = str(event.get_sender_id())
+
+        if not self._is_admin(sender_id):
+            yield event.plain_result("权限不足，此命令仅限管理员使用。")
+            event.stop_event()
+            return
+
+        self.pay_service.clear_credentials()
+        await self._clear_credentials()
+
+        yield event.plain_result("已清除登录信息。")
+
+    # === User Commands ===
+
+    @filter.command("ele_set")
+    async def ele_set(self, event: AstrMessageEvent):
+        """设置宿舍信息。用法: /ele_set"""
+        sender_id = str(event.get_sender_id())
+
+        # Check if system is configured
+        if not self.pay_service._credentials:
+            yield event.plain_result("系统未配置，请等待管理员设置登录信息。")
+            event.stop_event()
+            return
+
+        yield event.plain_result(
+            "请输入宿舍信息，格式如下：\n"
+            "校区 楼栋ID 楼栋名称 房间号\n"
+            "例如：翡翠湖 1栋 1 101\n"
+            "提示：楼栋ID需要从缴费系统查询，可先用 /ele_search 搜索"
+        )
+
+        @session_waiter(timeout=120)
+        async def set_session(controller: SessionController, ev: AstrMessageEvent):
+            parts = ev.message_str.strip().split()
+
+            if len(parts) < 4:
+                await ev.send(ev.plain_result("格式错误，请按以下格式输入：\n校区 楼栋ID 楼栋名称 房间号"))
+                controller.keep(timeout=120)
+                return
+
+            campus = parts[0]
+            building_id = parts[1]
+            building_name = parts[2]
+            room_id = parts[3]
+
+            # Create dorm config
+            dorm = DormConfig(
+                campus=campus,
+                building_id=building_id,
+                building_name=building_name,
+                room_id=room_id,
+                dorm_name=f"{campus} {building_name} {room_id}",
+            )
+
+            # Verify by querying
+            ims = await self.pay_service.get_electricity(
+                campus=campus,
+                building_name=building_name,
+                building_id=building_id,
+                room_id=room_id,
+            )
+
+            if ims and ims.code == 0:
+                # Save dorm config
+                await self.dorm_manager.set_dorm(sender_id, dorm)
+                await ev.send(ev.plain_result(
+                    f"宿舍设置成功！\n{ims.format_result(dorm.get_display_name())}"
+                ))
+            else:
+                await ev.send(ev.plain_result(
+                    "验证失败，可能是信息错误或登录已过期。\n"
+                    "请重新输入正确的宿舍信息："
+                ))
+                controller.keep(timeout=120)
+
+            controller.stop()
+
+        try:
+            await set_session(event)
+        except TimeoutError:
+            yield event.plain_result("输入超时，请重新执行 /ele_set")
+        finally:
+            event.stop_event()
+
+    @filter.command("ele_my")
+    async def ele_my(self, event: AstrMessageEvent):
+        """查看我设置的宿舍。用法: /ele_my"""
+        sender_id = str(event.get_sender_id())
+
+        dorm = await self.dorm_manager.get_dorm(sender_id)
+
+        if not dorm:
+            yield event.plain_result("您还没有设置宿舍信息，请使用 /ele_set 设置。")
+            return
+
+        yield event.plain_result(f"您设置的宿舍：{dorm.get_display_name()}")
+
+    @filter.command("ele_del")
+    async def ele_del(self, event: AstrMessageEvent):
+        """删除我的宿舍设置。用法: /ele_del"""
+        sender_id = str(event.get_sender_id())
+
+        removed = await self.dorm_manager.remove_dorm(sender_id)
+
+        if removed:
+            yield event.plain_result("已删除您的宿舍设置。")
+        else:
+            yield event.plain_result("您还没有设置宿舍信息。")
+
+    # === Query Commands ===
+
+    @filter.command("ele")
+    async def ele_query(self, event: AstrMessageEvent):
+        """查询电费。用法: /ele [宿舍号]\n无参数时查询所有已设置的宿舍"""
+        sender_id = str(event.get_sender_id())
+
+        # Check if system is configured
+        if not self.pay_service._credentials:
+            yield event.plain_result("系统未配置，请等待管理员设置登录信息。")
+            return
+
+        # Get all dorms
+        all_dorms = await self.dorm_manager.get_all_dorms()
+
+        if not all_dorms:
+            yield event.plain_result("还没有人设置宿舍信息。请先使用 /ele_set 设置。")
+            return
+
+        # Query all dorms
+        yield event.plain_result(f"正在查询 {len(all_dorms)} 个宿舍的电费...")
+
+        try:
+            results = await self.pay_service.query_multiple(all_dorms)
+
+            # Format results
+            lines = ["📊 电费查询结果：", ""]
+            for sid, dorm, result in results:
+                if isinstance(result, IMSResponse):
+                    lines.append(result.format_result(dorm.get_display_name()))
+                    lines.append("")
+                else:
+                    lines.append(f"❌ {dorm.get_display_name()}: {result}")
+                    lines.append("")
+
+            yield event.plain_result("\n".join(lines))
+
+        except Exception as e:
+            logger.error(f"Query failed: {e}", exc_info=True)
+            yield event.plain_result(f"查询失败：{e}")
+
+    @filter.command("ele_one")
+    async def ele_one(self, event: AstrMessageEvent, room: str = ""):
+        """查询单个宿舍电费。用法: /ele_one <宿舍号>"""
+        sender_id = str(event.get_sender_id())
+
+        if not room:
+            yield event.plain_result("请提供宿舍号，例如：/ele_one 101")
+            return
+
+        # Check if system is configured
+        if not self.pay_service._credentials:
+            yield event.plain_result("系统未配置，请等待管理员设置登录信息。")
+            return
+
+        # Check if user has dorm set
+        dorm = await self.dorm_manager.get_dorm(sender_id)
+
+        if not dorm:
+            yield event.plain_result("您还没有设置宿舍信息，请先使用 /ele_set 设置。")
+            return
+
+        # Use stored dorm config but with provided room number
+        query_dorm = DormConfig(
+            campus=dorm.campus,
+            building_id=dorm.building_id,
+            building_name=dorm.building_name,
+            room_id=room,
+            dorm_name=f"{dorm.building_name} {room}",
+        )
+
+        try:
+            ims = await self.pay_service.get_electricity(
+                campus=query_dorm.campus,
+                building_name=query_dorm.building_name,
+                building_id=query_dorm.building_id,
+                room_id=query_dorm.room_id,
+            )
+
+            if ims:
+                yield event.plain_result(ims.format_result(query_dorm.get_display_name()))
+            else:
+                yield event.plain_result("查询失败，可能是房间号不存在或登录已过期。")
+
+        except Exception as e:
+            logger.error(f"Query one failed: {e}")
+            yield event.plain_result(f"查询失败：{e}")
+
+    # === Status Commands ===
+
+    @filter.command("ele_status")
+    async def ele_status(self, event: AstrMessageEvent):
+        """查看插件状态。用法: /ele_status"""
+        sender_id = str(event.get_sender_id())
+        is_admin = self._is_admin(sender_id)
+
+        # Get status
+        has_session = self.pay_service.has_session()
+        has_credentials = self.pay_service._credentials is not None
+        dorm_count = await self.dorm_manager.get_dorm_count()
+
+        lines = [
+            "📋 电费查询插件状态",
+            "",
+            f"登录状态: {'已登录' if has_session else '未登录'}",
+            f"凭证状态: {'已配置' if has_credentials else '未配置'}",
+            f"宿舍数量: {dorm_count} 个",
+        ]
+
+        if is_admin:
+            lines.extend([
+                "",
+                "管理员信息:",
+                f"您的ID: {sender_id}",
+                f"管理员列表: {self.admin_users or '(未设置，所有人可管理)'}",
+            ])
+
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("ele_help")
+    async def ele_help(self, event: AstrMessageEvent):
+        """查看帮助信息。用法: /ele_help"""
+        lines = [
+            "📖 电费查询插件帮助",
+            "",
+            "【管理员命令】",
+            "/ele_login - 设置缴费系统登录",
+            "/ele_logout - 清除登录信息",
+            "",
+            "【用户命令】",
+            "/ele_set - 设置宿舍信息",
+            "/ele_my - 查看我的宿舍",
+            "/ele_del - 删除我的宿舍",
+            "",
+            "【查询命令】",
+            "/ele - 查询所有宿舍电费",
+            "/ele_one <房间号> - 查询指定房间",
+            "",
+            "【其他】",
+            "/ele_status - 查看插件状态",
+            "/ele_help - 查看此帮助",
+        ]
+
+        yield event.plain_result("\n".join(lines))

@@ -1,0 +1,8 @@
+{
+  "admin_users": {
+    "description": "管理员用户ID列表（用于设置登录等管理操作）",
+    "type": "list",
+    "default": [],
+    "hint": "填写QQ号或用户ID，多个用逗号分隔。留空则所有人都可以管理。"
+  }
+}
