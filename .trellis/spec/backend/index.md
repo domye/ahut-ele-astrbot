@@ -39,6 +39,7 @@ Before writing any plugin code, read these documents:
 | [Error Handling](./error-handling.md) | Exception handling in async handlers | ✅ Complete |
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, async patterns | ✅ Complete |
 | [Logging Guidelines](./logging-guidelines.md) | AstrBot logger usage | ✅ Complete |
+| [MCP Tools Usage](./mcp-tools-usage.md) | Correct usage of MCP tools like context7 | ✅ Complete |
 
 ---
 

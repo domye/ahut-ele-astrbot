@@ -7,7 +7,8 @@
       "Bash(python:*)",
       "WebFetch(domain:docs.astrbot.app)",
       "Read(//e/github/ahut-tool/**)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(python3:*)"
     ]
   }
 }

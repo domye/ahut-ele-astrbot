@@ -9,12 +9,13 @@ Features:
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import AstrBotConfig, logger
+from astrbot.api.message_components import MessageChain
 from astrbot.core.utils.session_waiter import session_waiter, SessionController
 from pathlib import Path
 import json
 import asyncio
 
-from .services import PayService, DormManager
+from .services import PayService, DormManager, ScheduleManager
 from .services.building_data import (
     CAMPUS_OPTIONS, get_buildings, get_building_by_id,
     format_campus_menu, format_building_menu, parse_campus_input
@@ -33,6 +34,7 @@ class AhutElePlugin(Star):
         # Services
         self.pay_service = PayService()
         self.dorm_manager = DormManager(self.name)
+        self.schedule_manager = ScheduleManager(self.name)
 
         # Admin users from config
         self.admin_users = config.get("admin_users", [])
@@ -47,13 +49,22 @@ class AhutElePlugin(Star):
         # Initialize dorm manager
         await self.dorm_manager.initialize()
 
+        # Initialize schedule manager
+        await self.schedule_manager.initialize()
+
         # Load stored credentials
         await self._load_credentials()
+
+        # Start scheduler
+        self.schedule_manager.start_scheduler(self._send_scheduled_query)
 
         logger.info(f"{self.name} initialized")
 
     async def terminate(self):
         """Cleanup on shutdown."""
+        # Stop scheduler
+        self.schedule_manager.stop_scheduler()
+
         await self.pay_service.close()
         logger.info(f"{self.name} terminated")
 
@@ -506,6 +517,10 @@ class AhutElePlugin(Star):
             "【管理员命令】",
             "/ele_login - 设置缴费系统登录",
             "/ele_logout - 清除登录信息",
+            "/ele_schedule_add <时间> - 添加定时发送（如：8:00,20:00）",
+            "/ele_schedule_list - 查看所有定时任务",
+            "/ele_schedule_del - 删除当前群的定时任务",
+            "/ele_schedule_edit <时间> - 修改当前群的定时时间",
             "",
             "【用户命令】",
             "/ele_set - 交互式设置宿舍（推荐）",
@@ -521,6 +536,162 @@ class AhutElePlugin(Star):
             "/ele_help - 查看此帮助",
             "",
             "💡 提示：使用 /ele_set 时会引导你选择校区、楼栋和房间号",
+            "💡 提示：定时发送会在指定时间自动推送所有宿舍的电费信息",
         ]
 
         yield event.plain_result("\n".join(lines))
+
+    # === Scheduled Task Methods ===
+
+    async def _send_scheduled_query(self, group_umo: str):
+        """Send scheduled electricity query to a group."""
+        # Check if system is configured
+        if not self.pay_service._credentials:
+            logger.warning("System not configured, skipping scheduled query")
+            return
+
+        # Get all dorms
+        all_dorms = await self.dorm_manager.get_all_dorms()
+
+        if not all_dorms:
+            logger.info("No dorms configured, skipping scheduled query")
+            return
+
+        try:
+            results = await self.pay_service.query_multiple(all_dorms)
+
+            # Format results
+            lines = ["📊 定时电费查询结果：", ""]
+            for sid, dorm, result in results:
+                lines.append(result.format_result())
+                lines.append("")
+
+            message = "\n".join(lines)
+
+            # Send message
+            message_chain = MessageChain().message(message)
+            await self.context.send_message(group_umo, message_chain)
+            logger.info(f"Sent scheduled query to {group_umo}")
+
+        except Exception as e:
+            logger.error(f"Scheduled query failed: {e}", exc_info=True)
+
+    # === Schedule Commands ===
+
+    @filter.command("ele_schedule_add")
+    async def ele_schedule_add(self, event: AstrMessageEvent, times: str = ""):
+        """添加定时发送任务（管理员）。用法: /ele_schedule_add <时间1,时间2,...>"""
+        sender_id = str(event.get_sender_id())
+
+        if not self._is_admin(sender_id):
+            yield event.plain_result("权限不足，此命令仅限管理员使用。")
+            event.stop_event()
+            return
+
+        if not times:
+            yield event.plain_result("请提供发送时间，例如：/ele_schedule_add 8:00,20:00")
+            return
+
+        # Parse times
+        parsed_times = self.schedule_manager.parse_times(times)
+
+        if not parsed_times:
+            yield event.plain_result("时间格式错误，请使用格式如：8:00,20:00")
+            return
+
+        # Get group UMO
+        group_umo = event.unified_msg_origin
+        group_name = group_umo.split(':')[-1] if ':' in group_umo else group_umo
+
+        # Add task
+        task = await self.schedule_manager.add_task(group_umo, group_name, parsed_times)
+
+        yield event.plain_result(
+            f"✅ 定时发送任务已添加\n"
+            f"群聊: {group_name}\n"
+            f"发送时间: {', '.join(task.times)}\n"
+            f"发送内容: 所有宿舍的电费查询结果"
+        )
+
+    @filter.command("ele_schedule_list")
+    async def ele_schedule_list(self, event: AstrMessageEvent):
+        """查看所有定时任务（管理员）。用法: /ele_schedule_list"""
+        sender_id = str(event.get_sender_id())
+
+        if not self._is_admin(sender_id):
+            yield event.plain_result("权限不足，此命令仅限管理员使用。")
+            event.stop_event()
+            return
+
+        tasks = await self.schedule_manager.get_all_tasks()
+
+        if not tasks:
+            yield event.plain_result("暂无定时发送任务。")
+            return
+
+        lines = ["📋 定时发送任务列表：", ""]
+        for i, task in enumerate(tasks, 1):
+            lines.append(f"{i}. 群聊: {task.group_name}")
+            lines.append(f"   时间: {', '.join(task.times)}")
+            lines.append("")
+
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("ele_schedule_del")
+    async def ele_schedule_del(self, event: AstrMessageEvent):
+        """删除当前群的定时任务（管理员）。用法: /ele_schedule_del"""
+        sender_id = str(event.get_sender_id())
+
+        if not self._is_admin(sender_id):
+            yield event.plain_result("权限不足，此命令仅限管理员使用。")
+            event.stop_event()
+            return
+
+        group_umo = event.unified_msg_origin
+
+        removed = await self.schedule_manager.remove_task(group_umo)
+
+        if removed:
+            yield event.plain_result("✅ 已删除当前群的定时发送任务。")
+        else:
+            yield event.plain_result("当前群没有设置定时发送任务。")
+
+    @filter.command("ele_schedule_edit")
+    async def ele_schedule_edit(self, event: AstrMessageEvent, times: str = ""):
+        """修改当前群的定时任务（管理员）。用法: /ele_schedule_edit <时间1,时间2,...>"""
+        sender_id = str(event.get_sender_id())
+
+        if not self._is_admin(sender_id):
+            yield event.plain_result("权限不足，此命令仅限管理员使用。")
+            event.stop_event()
+            return
+
+        if not times:
+            yield event.plain_result("请提供发送时间，例如：/ele_schedule_edit 8:00,20:00")
+            return
+
+        # Parse times
+        parsed_times = self.schedule_manager.parse_times(times)
+
+        if not parsed_times:
+            yield event.plain_result("时间格式错误，请使用格式如：8:00,20:00")
+            return
+
+        # Get group UMO
+        group_umo = event.unified_msg_origin
+        group_name = group_umo.split(':')[-1] if ':' in group_umo else group_umo
+
+        # Check if task exists
+        existing = await self.schedule_manager.get_task(group_umo)
+        if not existing:
+            yield event.plain_result("当前群没有设置定时发送任务，请先使用 /ele_schedule_add 添加。")
+            return
+
+        # Update task
+        task = await self.schedule_manager.add_task(group_umo, group_name, parsed_times)
+
+        yield event.plain_result(
+            f"✅ 定时发送任务已修改\n"
+            f"群聊: {group_name}\n"
+            f"发送时间: {', '.join(task.times)}"
+        )
