@@ -5,6 +5,7 @@ Reference: ahut-tool/backend/pay/
 
 import aiohttp
 import asyncio
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Tuple
 from astrbot.api import logger
 from ..models import IMSResponse, ElectricityResult
@@ -21,10 +22,14 @@ class PayService:
     IMS_URL = BASE_URL + "/Charge/IMS?state=WXSTATEFLAG"
     IMS_SERVICE_URL = BASE_URL + "/Charge/GetIMS_AHUTService"
 
+    # Session timeout: 30 minutes
+    SESSION_TIMEOUT = timedelta(minutes=30)
+
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
         self._cookie: str = ""
         self._credentials: Optional[Tuple[str, str]] = None  # (username, password)
+        self._login_time: Optional[datetime] = None  # Last successful login time
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create HTTP session."""
@@ -43,12 +48,19 @@ class PayService:
             self._session = None
 
     def has_session(self) -> bool:
-        """Check if we have a valid session."""
-        return self._cookie != ""
+        """Check if we have a valid session (not expired)."""
+        if not self._cookie:
+            return False
+        # Check if session has expired (30 minutes)
+        if self._login_time is None:
+            return False
+        elapsed = datetime.now() - self._login_time
+        return elapsed < self.SESSION_TIMEOUT
 
     def clear_session(self):
         """Clear the session cookie."""
         self._cookie = ""
+        self._login_time = None
 
     def set_credentials(self, username: str, password: str):
         """Store credentials for auto-login."""
@@ -58,6 +70,7 @@ class PayService:
         """Clear stored credentials."""
         self._credentials = None
         self._cookie = ""
+        self._login_time = None
 
     async def login(self, username: str, password: str) -> Tuple[bool, str]:
         """
@@ -103,16 +116,19 @@ class PayService:
             # Check login result
             if status == 302:
                 # Redirect means login success
+                self._login_time = datetime.now()
                 return True, "登录成功"
 
             if status == 200:
                 # Check for error messages first
                 if "用户名或密码错误" in body or "登录失败" in body or "error" in body.lower():
                     self._cookie = ""
+                    self._login_time = None
                     return False, "用户名或密码错误"
 
                 # 200 + cookie = success
                 if self._cookie:
+                    self._login_time = datetime.now()
                     return True, "登录成功"
 
             return False, f"登录失败 (状态码: {status})"
@@ -130,14 +146,27 @@ class PayService:
 
         Returns: (success, message)
         """
+        # Check if session is still valid (within 30 minutes)
         if self.has_session():
+            elapsed = datetime.now() - self._login_time
+            remaining = self.SESSION_TIMEOUT - elapsed
+            logger.debug(f"Session valid, remaining time: {int(remaining.total_seconds())}s")
             return True, "已登录"
 
+        # Session expired or not logged in, need to re-login
         if not self._credentials:
             return False, "请先配置登录信息"
 
+        logger.info("Session expired (over 30 minutes), re-login required")
         username, password = self._credentials
-        return await self.login(username, password)
+        success, message = await self.login(username, password)
+
+        if success:
+            logger.info(f"Re-login successful at {self._login_time}")
+        else:
+            logger.warning(f"Re-login failed: {message}")
+
+        return success, message
 
     async def get_electricity(
         self,

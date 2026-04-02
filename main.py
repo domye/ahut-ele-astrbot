@@ -6,6 +6,7 @@ Features:
 - Query electricity for all configured dorms
 """
 
+from datetime import datetime
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
 from astrbot.api import AstrBotConfig, logger
@@ -491,10 +492,19 @@ class AhutElePlugin(Star):
         has_credentials = self.pay_service._credentials is not None
         dorm_count = await self.dorm_manager.get_dorm_count()
 
+        # Calculate session remaining time
+        session_info = "未登录"
+        if has_session and self.pay_service._login_time:
+            elapsed = datetime.now() - self.pay_service._login_time
+            remaining = self.pay_service.SESSION_TIMEOUT - elapsed
+            session_info = f"已登录 (剩余 {int(remaining.total_seconds() // 60)} 分钟)"
+        elif self.pay_service._cookie and not has_session:
+            session_info = "已过期 (需重新登录)"
+
         lines = [
             "📋 电费查询插件状态",
             "",
-            f"登录状态: {'已登录' if has_session else '未登录'}",
+            f"登录状态: {session_info}",
             f"凭证状态: {'已配置' if has_credentials else '未配置'}",
             f"宿舍数量: {dorm_count} 个",
         ]
