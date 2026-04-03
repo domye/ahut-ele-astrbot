@@ -1,75 +1,181 @@
-# ahut-ele-astrbot
+# AHUT 电费查询插件
 
-安徽工业大学电费查询 AstrBot 插件
+> **AstrBot 插件** - 安徽工业大学宿舍电费查询与定时推送
 
 > [!NOTE]
 > 这是一个 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 插件，用于查询安徽工业大学宿舍电费。
 >
 > [AstrBot](https://github.com/AstrBotDevs/AstrBot) 是一个支持多平台的智能对话机器人框架。
 
+---
+
 ## 功能特性
 
-- **管理员登录设置**: 管理员可以配置缴费系统登录信息
-- **用户宿舍设置**: 群内用户可以设置自己的宿舍信息
-- **电费查询**: 查询所有已配置宿舍的电费余额
+- **管理员登录设置**: 配置缴费系统登录信息
+- **交互式宿舍设置**: 引导式选择校区、楼栋、房间
+- **电费查询**: 查询单个或多个宿舍的电费余额
+- **定时推送**: 自动在指定时间推送电费信息到群聊
+- **会话持久化**: 数据自动保存，重启后保留
 
-## 安装依赖
+---
 
-本插件需要 RSA 加密库：
+## 安装
+
+### 依赖安装
 
 ```bash
-pip install cryptography
+pip install cryptography aiohttp
 ```
+
+### 插件安装
+
+将本插件目录放入 AstrBot 的 `addons/plugins/` 目录下即可。
+
+---
 
 ## 使用方法
 
-### 管理员命令
+### 命令格式
+
+所有命令以 `电费` 开头，支持中文命令：
+
+#### 管理员命令
 
 | 命令 | 说明 |
 |------|------|
-| `/ele_login` | 设置缴费系统登录（学号和密码） |
-| `/ele_logout` | 清除登录信息 |
+| `电费 登录` | 设置缴费系统登录（学号和密码） |
+| `电费 登出` | 清除登录信息 |
+| `电费 定时 添加 <时间>` | 添加定时发送任务，如：`电费 定时 添加 8:00,20:00` |
+| `电费 定时 列表` | 查看所有定时任务 |
+| `电费 定时 删除` | 删除当前群的定时任务 |
+| `电费 定时 设置 <时间>` | 修改定时任务时间 |
 
-### 用户命令
-
-| 命令 | 说明 |
-|------|------|
-| `/ele_set` | 设置宿舍信息 |
-| `/ele_my` | 查看我的宿舍设置 |
-| `/ele_del` | 删除我的宿舍设置 |
-
-### 查询命令
+#### 用户命令
 
 | 命令 | 说明 |
 |------|------|
-| `/ele` | 查询所有已设置宿舍的电费 |
-| `/ele_one <房间号>` | 查询指定房间电费 |
-| `/ele_status` | 查看插件状态 |
-| `/ele_help` | 查看帮助信息 |
+| `电费 设置` | 交互式设置宿舍信息（选择校区→楼栋→房间） |
+| `电费 我的` | 查看我的宿舍设置 |
+| `电费 删除` | 删除我的宿舍设置 |
+| `电费 查询` | 查询所有已设置宿舍的电费 |
+| `电费 查询 <房间号>` | 查询指定房间电费 |
+| `电费 状态` | 查看插件状态 |
+| `电费 帮助` | 查看帮助信息 |
 
-## 设置宿舍信息格式
+---
 
-设置宿舍时，请按以下格式输入：
+## 设置宿舍流程
 
 ```
-校区 楼栋ID 栋名称 房间号
+用户: 电费 设置
+Bot: 🏠 请选择校区：
+
+     1. 新校区
+     2. 老校区
+
+     请输入序号或校区名称，或输入'取消'退出：
+
+用户: 1
+Bot: 🏢 新校区楼栋列表（第1/3页）：
+
+     1. 东校区1号学生宿舍楼
+     2. 东校区2号学生宿舍楼
+     ...
+
+     输入序号选择楼栋，或 'n'下一页, 'p'上一页, '取消'退出
+
+用户: 5
+Bot: 已选择：东校区5号学生宿舍楼
+     请输入房间号（如：101），或输入'取消'退出：
+
+用户: 101
+Bot: 正在验证宿舍信息...
+
+     ✅ 宿舍设置成功！
+
+     🏠 东校区 东校区5号学生宿舍楼 101
+     🔌 房间剩余: 123.45 kWh
+     ❄️ 空调剩余: 67.89 kWh
 ```
 
-例如：
-```
-翡翠湖 1 1栋 101
-```
-
-注意：楼栋ID需要从缴费系统查询获取。
+---
 
 ## 配置项
 
 在 AstrBot 管理面板中可以配置：
 
-- `admin_users`: 管理员用户ID列表（QQ号），留空则所有人都可以管理
+- `admin_users`: 管理员用户ID列表（QQ号），留空则只有第一个设置登录信息的用户成为管理员
+
+---
+
+## 技术架构
+
+```
+astrbot_plugin_ahut_ele/
+├── main.py                    # 插件入口
+├── metadata.yaml              # 插件元数据
+├── core/                      # 核心模块
+│   ├── constants.py           # 常量定义
+│   ├── exceptions.py          # 异常体系
+│   └── logger.py              # 日志工具
+├── handlers/                  # 命令处理器
+│   ├── admin_handler.py       # 管理员命令
+│   ├── user_handler.py        # 用户命令
+│   ├── query_handler.py       # 查询命令
+│   └── schedule_handler.py    # 定时任务
+├── services/                  # 业务逻辑
+│   ├── pay_service.py         # 缴费系统服务
+│   ├── building_service.py    # 楼栋数据服务
+│   └── scheduler_service.py   # 定时任务服务
+├── repositories/              # 数据访问层
+│   ├── credential_repository.py
+│   ├── dorm_repository.py
+│   └── schedule_repository.py
+├── models/                    # 数据模型
+│   ├── entities.py
+│   └── dto.py
+└── utils/                     # 工具
+    └── rsa_utils.py           # RSA加密
+```
+
+### 架构特点
+
+- **分层架构**: Core → Models → Repositories → Services → Handlers
+- **Repository 模式**: 数据访问抽象，便于切换存储后端
+- **异常体系**: 分层错误处理，用户友好提示
+- **定时任务**: 异步调度，支持多时间配置
+
+---
+
+## 注意事项
+
+1. **登录会话有效期**: 30分钟，过期后自动重新登录
+2. **定时任务**: 需要管理员权限，支持多时间点（如 `8:00,12:00,20:00`）
+3. **宿舍验证**: 设置时会自动验证宿舍是否存在
+4. **数据存储**: 所有数据保存在 `data/plugin_data/ahut_ele/` 目录
+
+---
+
+## 更新日志
+
+### v2.0.1
+- 重构架构，分层设计
+- 新命令格式（去掉 `/` 前缀）
+- 添加定时任务功能
+- 交互式宿舍设置
+
+### v1.0.x
+- 基础电费查询功能
+
+---
 
 ## 相关链接
 
-- [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+- [AstrBot 官方仓库](https://github.com/AstrBotDevs/AstrBot)
+- [AstrBot 插件开发文档](https://docs.astrbot.app/dev/star/plugin-new.html)
+
+---
+
+## License
+
+MIT License
